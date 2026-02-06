@@ -109,7 +109,8 @@ class Handler(BaseHTTPRequestHandler):
             raise Exception("couldnt find stream url")
 
         try:
-            parsed_url = urlparse(url)
+            _url = url
+            parsed_url = urlparse(_url)
             query_params = parse_qs(parsed_url.query)
 
             yo_fb_encoded = query_params.get('yo.eb.fb', [None])[0]
@@ -141,6 +142,7 @@ class Handler(BaseHTTPRequestHandler):
                 url = url.split('?')[0] + '?' + urlencode(parse_qsl(url.split('?')[1]))
 
         url = url.strip('?')
+        print(f"Redirect to: {url}")
         self.send_response(302)
         self.send_header("Location", url)
         self.end_headers()
