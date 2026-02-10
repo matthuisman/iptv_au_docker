@@ -96,7 +96,10 @@ class Handler(BaseHTTPRequestHandler):
             'region': params['region'],
             'offset': 0,
         }
-        data = requests.get('https://api.9now.com.au/ctv/livestreams', params=query, headers={'Authorization': f'Bearer {access_token}'}).json()['data']['getLivestream']
+        data = requests.get('https://api.9now.com.au/ctv/livestreams', params=query, headers={'Authorization': f'Bearer {access_token}'}).json()
+        if "errors" in data:
+            raise Exception(data)
+        data = data['data']['getLivestream']
         data['channels'].extend([row for row in data['events'] if row['type'] == 'live-event' and row['nextEvent']['name']])
 
         url = None
@@ -199,13 +202,13 @@ class Handler(BaseHTTPRequestHandler):
 
         host = self.headers.get('Host')
 
-        self.wfile.write(b'#EXTM3U\n')
-        for key in sorted(channels.keys(), key=lambda x: channels[x].get('chno', 9999999) if sort == 'chno' else channels[x]['name'].strip().lower()):
-            channel = channels[key]
+        self.wfile.write(b'#EXTM3U\n\n')
+        for slug in sorted(channels.keys(), key=lambda x: channels[x].get('chno', 9999999) if sort == 'chno' else channels[x]['name'].strip().lower()):
+            channel = channels[slug]
             logo = channel['logo']
             name = channel['name']
             url = channel['mjh_master']
-            channel_id = f'iptv-au-{key}'
+            channel_id = f'iptv-au-{slug}'
 
             if url.lower().startswith('plugin://slyguy.9now/'):
                 url = f"http://{host}/{DEEPLINK_PATH}/{url}"
@@ -228,8 +231,16 @@ class Handler(BaseHTTPRequestHandler):
             elif channel.get('chno') is not None:
                 chno = ' tvg-chno="{}"'.format(channel['chno'])
 
+            headers = {key: value for key, value in channel.get('headers', {}).items() if key in ('user-agent', 'referer')}
+            tags = []
+            for key, value in headers.items():
+                if value.startswith(' '):
+                    value = u'%20{}'.format(value)
+                tags.append(f'http-{key.lower()}={value}')
+            tags = "\n".join(f'#EXTVLCOPT:{tag}' for tag in tags)
+
             # Write channel information
-            self.wfile.write(f'#EXTINF:-1 channel-id="{channel_id}" tvg-id="{key}" tvg-logo="{logo}"{chno},{name}\n{url}\n'.encode('utf8'))
+            self.wfile.write(f'#EXTINF:-1 channel-id="{channel_id}" tvg-id="{slug}" tvg-logo="{logo}"{chno},{name}\n{tags}\n{url}\n\n'.encode('utf8'))
 
     def _epg(self):
         url = EPG_URL.format(region=REGION)
