@@ -16,6 +16,7 @@ from cachelib import SimpleCache
 
 
 PLAYLIST_PATH = 'playlist.m3u8'
+TVH_PLAYLIST_PATH = 'tvh.m3u8'
 EPG_PATH = 'epg.xml'
 CLEAR_CACHE_PATH = 'clear_cache'
 DEEPLINK_PATH = 'deep_link'
@@ -32,6 +33,14 @@ CACHE_DIR = os.path.join(gettempdir(), 'iptv-au-docker')
 os.makedirs(CACHE_DIR, exist_ok=True)
 print(f"Cache dir: {CACHE_DIR}")
 cache = SimpleCache()
+
+
+def tvh_headers(headers=None):
+    string = ''
+    if headers:
+        for key in headers:
+            string += u'{0}:\ {1}\\r\\n'.format(key, '{}'.format(headers[key]).replace(' ', '\ '))
+    return string.strip()
 
 
 def is_valid_url(url):
@@ -64,6 +73,7 @@ class Handler(BaseHTTPRequestHandler):
 
         routes = {
             PLAYLIST_PATH: self._playlist,
+            TVH_PLAYLIST_PATH: self._tvh_playlist,
             EPG_PATH: self._epg,
             STATUS_PATH: self._status,
             CLEAR_CACHE_PATH: self._clear_cache,
@@ -188,7 +198,10 @@ class Handler(BaseHTTPRequestHandler):
         cache.set(app_url, cache_path, timeout=CACHE_TIME)
         return data
 
-    def _playlist(self):
+    def _tvh_playlist(self):
+        self._playlist(_type='tvh')
+
+    def _playlist(self, _type='m3u8'):
         channels = self._app_data()
 
         start_chno = int(self._params['start_chno']) if 'start_chno' in self._params else None
@@ -209,6 +222,7 @@ class Handler(BaseHTTPRequestHandler):
             name = channel['name']
             url = channel['mjh_master']
             channel_id = f'iptv-au-{slug}'
+            is_radio = channel.get('is_radio', False)
 
             if url.lower().startswith('plugin://slyguy.9now/'):
                 url = f"http://{host}/{DEEPLINK_PATH}/{url}"
@@ -231,16 +245,24 @@ class Handler(BaseHTTPRequestHandler):
             elif channel.get('chno') is not None:
                 chno = ' tvg-chno="{}"'.format(channel['chno'])
 
-            headers = {key: value for key, value in channel.get('headers', {}).items() if key in ('user-agent', 'referer')}
-            tags = []
-            for key, value in headers.items():
-                if value.startswith(' '):
-                    value = u'%20{}'.format(value)
-                tags.append(f'http-{key.lower()}={value}')
-            tags = "\n".join(f'#EXTVLCOPT:{tag}' for tag in tags)
+            if _type == 'tvh':
+                headers = tvh_headers(channel.get('headers'))
+                url = "pipe://ffmpeg -loglevel fatal -probesize 10M -analyzeduration 0 -fpsprobesize 0 {headers}-i {url}{radio} -vcodec copy -acodec copy -metadata service_name={id} -f mpegts pipe:1".format(
+                    headers=headers, url=url, radio=' -mpegts_service_type digital_radio' if is_radio else '', id=channel_id)
+                tags = ''
+            else:
+                headers = {key: value for key, value in channel.get('headers', {}).items() if key in ('user-agent', 'referer')}
+                tags = []
+                for key, value in headers.items():
+                    if value.startswith(' '):
+                        value = u'%20{}'.format(value)
+                    tags.append(f'http-{key.lower()}={value}')
+                tags = "\n".join(f'#EXTVLCOPT:{tag}' for tag in tags)
+                if tags:
+                    tags = '\n' + tags
 
             # Write channel information
-            self.wfile.write(f'#EXTINF:-1 channel-id="{channel_id}" tvg-id="{slug}" tvg-logo="{logo}"{chno},{name}\n{tags}\n{url}\n\n'.encode('utf8'))
+            self.wfile.write(f'#EXTINF:-1 channel-id="{channel_id}" tvg-id="{slug}" tvg-logo="{logo}"{chno},{name}{tags}\n{url}\n\n'.encode('utf8'))
 
     def _epg(self):
         url = EPG_URL.format(region=REGION)
@@ -293,6 +315,7 @@ class Handler(BaseHTTPRequestHandler):
             </head>
             <body>
                 Playlist URL: <b><a href="http://{host}/{PLAYLIST_PATH}">http://{host}/{PLAYLIST_PATH}</a></b><br>
+                TvHeadend Playlist URL: <b><a href="http://{host}/{TVH_PLAYLIST_PATH}">http://{host}/{TVH_PLAYLIST_PATH}</a></b><br>
                 EPG URL (Set to refresh once per hour): <b><a href="http://{host}/{EPG_PATH}">http://{host}/{EPG_PATH}</a></b></body></html>
         '''.encode('utf8'))
 
