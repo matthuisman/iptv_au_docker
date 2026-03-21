@@ -11,6 +11,8 @@ from socketserver import ThreadingMixIn
 from base64 import b64encode, b64decode
 from urllib.parse import urlparse, parse_qsl, urlencode, unquote, parse_qs
 
+import re
+
 import requests
 from cachelib import SimpleCache
 
@@ -261,8 +263,12 @@ class Handler(BaseHTTPRequestHandler):
                 if tags:
                     tags = '\n' + tags
 
+            # Derive group from slug region suffix, fall back to national
+            m = re.search(r'-(nsw|vic|qld|sa|wa|tas|nt|act)(-|$)', slug, re.I)
+            group = f'AU| {m.group(1).upper()}' if m else 'AU| FREE TO AIR'
+
             # Write channel information
-            self.wfile.write(f'#EXTINF:-1 channel-id="{channel_id}" tvg-id="{slug}" tvg-logo="{logo}"{chno},{name}{tags}\n{url}\n\n'.encode('utf8'))
+            self.wfile.write(f'#EXTINF:-1 channel-id="{channel_id}" tvg-id="{slug}" tvg-logo="{logo}"{chno} group-title="{group}",{name}{tags}\n{url}\n\n'.encode('utf8'))
 
     def _epg(self):
         url = EPG_URL.format(region=REGION)
