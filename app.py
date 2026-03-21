@@ -263,9 +263,20 @@ class Handler(BaseHTTPRequestHandler):
                 if tags:
                     tags = '\n' + tags
 
-            # Derive group from slug region suffix, fall back to national
+            # Derive group from slug region/city suffix, fall back to national
+            _CITY_STATE = {
+                'mel': 'VIC', 'syd': 'NSW', 'bri': 'QLD', 'ade': 'SA', 'per': 'WA',
+                'cns': 'QLD', 'tsv': 'QLD', 'mky': 'QLD', 'rky': 'QLD',
+                'wby': 'QLD', 'twb': 'QLD', 'ssc': 'QLD', 'coast': 'QLD',
+                'newcastle': 'NSW', 'lismore': 'NSW', 'mountains': 'NSW',
+            }
             m = re.search(r'-(nsw|vic|qld|sa|wa|tas|nt|act)(-|$)', slug, re.I)
-            group = f'AU| {m.group(1).upper()}' if m else 'AU| FREE TO AIR'
+            if m:
+                state = m.group(1).upper()
+            else:
+                city = slug.split('-')[-1].lower()
+                state = _CITY_STATE.get(city)
+            group = f'AU| {state}' if state else 'AU| FREE TO AIR'
 
             # Write channel information
             self.wfile.write(f'#EXTINF:-1 channel-id="{channel_id}" tvg-id="{slug}" tvg-logo="{logo}"{chno} group-title="{group}",{name}{tags}\n{url}\n\n'.encode('utf8'))
