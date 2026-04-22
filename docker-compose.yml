@@ -1,7 +1,10 @@
 services:
   iptv-au:
     container_name: iptv-au
-    image: matthuisman/iptv-au
+    build:
+      context: .
+      dockerfile: Dockerfile
+    pull_policy: build
     environment:
       - REGION=all
     ports:
