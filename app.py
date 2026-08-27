@@ -2,19 +2,19 @@
 import os
 import json
 import gzip
+import time
 import argparse
-from base64 import b64encode
-from io import BytesIO
+import threading
+import traceback
+from base64 import b64decode
 from tempfile import gettempdir
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
-from base64 import b64encode, b64decode
 from urllib.parse import urlparse, parse_qsl, urlencode, unquote, parse_qs
 
 import re
 
 import requests
-from cachelib import SimpleCache
 
 
 PLAYLIST_PATH = 'playlist.m3u8'
@@ -26,15 +26,41 @@ STATUS_PATH = ''
 APP_URL = 'https://i.mjh.nz/au/{region}/tv.json.gz'
 EPG_URL = 'https://i.mjh.nz/au/{region}/epg.xml.gz'
 DELIMITER = '|'
-TIMEOUT = (5,20) #connect,read
-CACHE_TIME = os.getenv("CACHE_TIME", 300) # default of 5mins
+TIMEOUT = (5, 20)  # connect,read
+CACHE_TIME = int(os.getenv("CACHE_TIME", 300))  # default of 5mins
 CHUNKSIZE = 1024
 REGION = os.environ.get('REGION', 'all')
 
+# REGION is fixed per process, so this is exactly two cacheable resources --
+# name includes REGION so multiple instances/regions can share a host tmpdir.
 CACHE_DIR = os.path.join(gettempdir(), 'iptv-au-docker')
+APP_CACHE_PATH = os.path.join(CACHE_DIR, f'app-{REGION}.json')
+EPG_CACHE_PATH = os.path.join(CACHE_DIR, f'epg-{REGION}.xml')
 os.makedirs(CACHE_DIR, exist_ok=True)
 print(f"Cache dir: {CACHE_DIR}")
-cache = SimpleCache()
+
+# Derive group-title from slug region/city suffix, fall back to national.
+_CITY_STATE = {
+    'mel': 'VIC', 'syd': 'NSW', 'bri': 'QLD', 'ade': 'SA', 'per': 'WA',
+    'cns': 'QLD', 'tsv': 'QLD', 'mky': 'QLD', 'rky': 'QLD',
+    'wby': 'QLD', 'twb': 'QLD', 'ssc': 'QLD', 'coast': 'QLD',
+    'newcastle': 'NSW', 'lismore': 'NSW', 'mountains': 'NSW',
+}
+
+
+def _cache_fresh(path):
+    return os.path.exists(path) and (time.time() - os.path.getmtime(path) < CACHE_TIME)
+
+
+def _atomic_write(path, data):
+    tmp_path = f'{path}.{os.getpid()}.{threading.get_ident()}.tmp'
+    try:
+        with open(tmp_path, 'wb') as f:
+            f.write(data)
+        os.replace(tmp_path, path)
+    finally:
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
 
 
 def tvh_headers(headers=None):
@@ -59,20 +85,27 @@ def is_valid_url(url):
 class Handler(BaseHTTPRequestHandler):
     def __init__(self, *args, **kwargs):
         self._params = {}
+        self._headers_sent = False
         super().__init__(*args, **kwargs)
 
-    def _error(self, message):
+    def flush_headers(self):
+        # Only place bytes actually reach the socket -- track *here*, not in
+        # send_response(), which only buffers the status line.
+        self._headers_sent = True
+        super().flush_headers()
+
+    def _error(self):
+        traceback.print_exc()
+        # Response may already be underway (e.g. mid-playlist) -- can't
+        # cleanly send a status line at that point, just stop.
+        if self._headers_sent:
+            return
         self.send_response(500)
+        self.send_header('Content-type', 'text/plain; charset=utf-8')
         self.end_headers()
-        self.wfile.write(f'Error: {message}'.encode('utf8'))
-        raise
+        self.wfile.write(b'Internal server error')
 
     def do_GET(self):
-        # Serve the favicon.ico file
-        if self.path == '/favicon.ico':
-            self._serve_favicon()
-            return
-
         routes = {
             PLAYLIST_PATH: self._playlist,
             TVH_PLAYLIST_PATH: self._tvh_playlist,
@@ -93,14 +126,14 @@ class Handler(BaseHTTPRequestHandler):
 
         try:
             routes[func]()
-        except Exception as e:
-            self._error(e)
+        except Exception:
+            self._error()
 
     def _deeplink(self):
         plugin_url = '/'.join(self.path.split('/')[2:])
         parsed = urlparse(plugin_url)
         params = dict(parse_qsl(parsed.query))
-        access_token = requests.get('https://i.mjh.nz/.tokens/9now.tk').text
+        access_token = requests.get('https://i.mjh.nz/.tokens/9now.tk', timeout=TIMEOUT).text
 
         query = {
             'device': 'web',
@@ -108,7 +141,7 @@ class Handler(BaseHTTPRequestHandler):
             'region': params['region'],
             'offset': 0,
         }
-        data = requests.get('https://api.9now.com.au/ctv/livestreams', params=query, headers={'Authorization': f'Bearer {access_token}'}).json()
+        data = requests.get('https://api.9now.com.au/ctv/livestreams', params=query, headers={'Authorization': f'Bearer {access_token}'}, timeout=TIMEOUT).json()
         if "errors" in data:
             raise Exception(data)
         data = data['data']['getLivestream']
@@ -163,41 +196,26 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def _clear_cache(self):
-        cache.clear()
+        for path in (APP_CACHE_PATH, EPG_CACHE_PATH):
+            if os.path.exists(path):
+                os.unlink(path)
         self.send_response(200)
         self.send_header("Content-type", "text/html; charset=utf-8")
         self.end_headers()
         self.wfile.write(b'Cache cleared')
 
-    def _serve_favicon(self):
-        # Serve the favicon file as an ICO file
-        try:
-            with open('favicon.ico', 'rb') as f:
-                self.send_response(200)
-                self.send_header('Content-Type', 'image/x-icon')
-                self.end_headers()
-                self.wfile.write(f.read())
-        except FileNotFoundError:
-            self.send_response(404)
-            self.end_headers()
-
     def _app_data(self):
         app_url = APP_URL.format(region=REGION)
-        cache_path = cache.get(app_url)
-        if cache_path and os.path.exists(cache_path):
+        if _cache_fresh(APP_CACHE_PATH):
             self.log_message(f"Cache hit: {app_url}")
-            with open(cache_path, 'r') as f:
+            with open(APP_CACHE_PATH, 'r') as f:
                 return json.load(f)
 
-        cache_path = os.path.join(CACHE_DIR, b64encode(app_url.encode()).decode())
         self.log_message(f"Downloading {app_url}...")
-        resp = requests.get(app_url, stream=True, timeout=TIMEOUT)
+        resp = requests.get(app_url, timeout=TIMEOUT)
         resp.raise_for_status()
-        json_text = gzip.GzipFile(fileobj=BytesIO(resp.content)).read()
-        data = json.loads(json_text)
-        with open(cache_path, 'w') as f:
-            json.dump(data, f)
-        cache.set(app_url, cache_path, timeout=CACHE_TIME)
+        data = json.loads(gzip.decompress(resp.content))
+        _atomic_write(APP_CACHE_PATH, json.dumps(data).encode('utf-8'))
         return data
 
     def _tvh_playlist(self):
@@ -264,12 +282,6 @@ class Handler(BaseHTTPRequestHandler):
                     tags = '\n' + tags
 
             # Derive group from slug region/city suffix, fall back to national
-            _CITY_STATE = {
-                'mel': 'VIC', 'syd': 'NSW', 'bri': 'QLD', 'ade': 'SA', 'per': 'WA',
-                'cns': 'QLD', 'tsv': 'QLD', 'mky': 'QLD', 'rky': 'QLD',
-                'wby': 'QLD', 'twb': 'QLD', 'ssc': 'QLD', 'coast': 'QLD',
-                'newcastle': 'NSW', 'lismore': 'NSW', 'mountains': 'NSW',
-            }
             m = re.search(r'-(nsw|vic|qld|sa|wa|tas|nt|act)(-|$)', slug, re.I)
             if m:
                 state = m.group(1).upper()
@@ -284,41 +296,27 @@ class Handler(BaseHTTPRequestHandler):
     def _epg(self):
         url = EPG_URL.format(region=REGION)
 
-        cache_path = cache.get(url)
-        if cache_path and os.path.exists(cache_path):
-            self.log_message(f"Cache hit: {url}...")
-            self.send_response(200)
-            self.send_header('Content-Type', 'application/xml')
-            self.end_headers()
-            with open(cache_path, 'rb') as f:
+        if _cache_fresh(EPG_CACHE_PATH):
+            self.log_message(f"Cache hit: {url}")
+        else:
+            self.log_message(f"Downloading {url}...")
+            resp = requests.get(url, timeout=TIMEOUT)
+            resp.raise_for_status()
+            _atomic_write(EPG_CACHE_PATH, gzip.decompress(resp.content))
+
+        # Serve from the (now guaranteed fresh + complete) cache file only.
+        # Headers are sent only once the download has fully succeeded, so a
+        # failed download never leaves a half-written response on the wire.
+        self.send_response(200)
+        self.send_header('Content-Type', 'application/xml')
+        self.end_headers()
+        with open(EPG_CACHE_PATH, 'rb') as f:
+            chunk = f.read(CHUNKSIZE)
+            while chunk:
+                self.wfile.write(chunk)
                 chunk = f.read(CHUNKSIZE)
-                while chunk:
-                    self.wfile.write(chunk)
-                    chunk = f.read(CHUNKSIZE)
-            return
-
-        self.log_message(f"Downloading {url}...")
-        cache_path = os.path.join(CACHE_DIR, b64encode(url.encode()).decode())
-        # Download the .gz EPG file
-        with open(cache_path, 'wb') as cache_f:
-            with requests.get(url, stream=True, timeout=TIMEOUT) as resp:
-                resp.raise_for_status()
-
-                self.send_response(200)
-                self.send_header('Content-Type', 'application/xml')
-                self.end_headers()
-
-                # Decompress the .gz content
-                with gzip.GzipFile(fileobj=BytesIO(resp.content)) as gz:
-                    chunk = gz.read(CHUNKSIZE)
-                    while chunk:
-                        cache_f.write(chunk)
-                        self.wfile.write(chunk)
-                        chunk = gz.read(CHUNKSIZE)
-        cache.set(url, cache_path, timeout=CACHE_TIME)
 
     def _status(self):
-        # Generate HTML content with the favicon link
         self.send_response(200)
         self.send_header("Content-type", "text/html; charset=utf-8")
         self.end_headers()
@@ -328,7 +326,6 @@ class Handler(BaseHTTPRequestHandler):
             <html>
             <head>
                 <title>IPTV AU for Docker</title>
-                <link rel="icon" href="/favicon.ico" type="image/x-icon">
             </head>
             <body>
                 Playlist URL: <b><a href="http://{host}/{PLAYLIST_PATH}">http://{host}/{PLAYLIST_PATH}</a></b><br>

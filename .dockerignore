@@ -1,0 +1,11 @@
+.git
+.github
+.claude
+.gitignore
+README.md
+docker-compose.yml
+build.sh
+*.log
+__pycache__
+*.pyc
+*.pyo
